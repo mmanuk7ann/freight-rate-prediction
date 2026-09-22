@@ -4,3 +4,4 @@ __pycache__/
 scorer_results/
 data/*.csv
 data/*.pdf
+models/
