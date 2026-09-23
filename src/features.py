@@ -75,6 +75,17 @@ def _near_holiday(dates: pd.Series, window_days: int = 3) -> pd.Series:
     return pd.Series(diffs.min(axis=1) <= window_days, index=dates.index)
 
 
+# Fixed distance-bucket cutoffs (not re-derived per call, so they apply
+# identically and without leakage to any future data). Chosen as the
+# train_test.csv distance terciles (~688mi / ~1324mi), rounded, so the three
+# buckets are roughly balanced on this dataset rather than using generic
+# industry short/medium/long-haul cutoffs (e.g. 250mi/750mi), which would
+# dump most of this particular dataset (median distance ~953mi) into a
+# single "long_haul" bucket and not actually split anything.
+DISTANCE_BUCKET_EDGES = [0, 700, 1300, np.inf]
+DISTANCE_BUCKET_LABELS = ["short_haul", "medium_haul", "long_haul"]
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add model-ready features to a cleaned loads dataframe. Does not mutate input.
 
@@ -91,6 +102,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     - day_of_year_sin / day_of_year_cos: cyclical encoding of day-of-year so Dec 31
       and Jan 1 are treated as adjacent rather than maximally far apart.
     - near_holiday: see _near_holiday rationale above.
+    - weight_per_mile: weight / distance -- a density proxy (heavy-for-its-distance
+      vs light-for-its-distance) distinct from either raw feature alone.
+    - distance_bucket: short/medium/long haul categorical (see DISTANCE_BUCKET_EDGES).
+      Gives a tree an explicit, cheap split point for haul-length x equipment or
+      haul-length x season interactions that it could in principle rediscover from
+      continuous `distance` alone, but only by spending extra splits/depth to do so.
 
     equipment is left as-is; see the module-level comment for how to encode it.
     """
@@ -110,5 +127,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["day_of_year_cos"] = np.cos(2 * np.pi * day_of_year_frac)
 
     out["near_holiday"] = _near_holiday(out["date"])
+
+    out["weight_per_mile"] = out["weight"] / out["distance"]
+    out["distance_bucket"] = pd.cut(
+        out["distance"], bins=DISTANCE_BUCKET_EDGES, labels=DISTANCE_BUCKET_LABELS
+    ).astype(str)
 
     return out

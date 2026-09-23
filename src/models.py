@@ -11,10 +11,16 @@ data -- see its docstring and reports/model_comparison.md for the numbers.
 The GBM challenger uses sklearn's HistGradientBoostingRegressor rather than
 LightGBM: LightGBM 4.7.0 installs but fails to import on this machine
 (`OSError: ... Library not loaded: @rpath/libomp.dylib` -- it needs the
-Homebrew libomp runtime, which isn't a pip-installable dependency and wasn't
-present). HistGradientBoostingRegressor is sklearn's native equivalent
-(histogram-binned gradient boosting, same family of algorithm as
+Homebrew libomp runtime, which isn't a pip-installable dependency). Retried
+in this session (re-installed lightgbm fresh, checked for a Homebrew libomp
+keg) -- still fails the same way, libomp still isn't present, so we're
+staying on HistGradientBoostingRegressor rather than spending more time on
+an environment issue outside this project's control. It's sklearn's native
+equivalent (histogram-binned gradient boosting, same family of algorithm as
 LightGBM/XGBoost) and needs no external runtime.
+
+Hyperparameter search uses Optuna (installs cleanly, no native-library
+issues) rather than a hand-picked grid.
 
 Run directly to fit/evaluate both models end-to-end:
     python src/models.py
@@ -28,6 +34,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import optuna
 import pandas as pd
 import shap
 import statsmodels.api as sm
@@ -35,6 +42,8 @@ import statsmodels.formula.api as smf
 from scipy import stats
 from sklearn.ensemble import HistGradientBoostingRegressor
 from statsmodels.tools.sm_exceptions import DomainWarning
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -147,10 +156,11 @@ def predict_glm(model, df: pd.DataFrame) -> np.ndarray:
     return np.asarray(model.predict(df))
 
 
-# GBM feature set is a superset of the GLM's -- trees handle irrelevant/noisy
-# inputs gracefully (they simply won't split on them), so there's little cost
-# to offering more and letting the model decide.
-GBM_NUMERIC_FEATURES = [
+# OLD (pre-this-session) GBM feature set -- kept as a fixed, named reference
+# so the "OLD tuned GBM" row in the final comparison table reproduces last
+# session's model exactly, rather than being redefined out from under it as
+# NEW_GBM_* below evolves.
+OLD_GBM_NUMERIC_FEATURES = [
     "distance",                # same primary predictor the GLM uses
     "haversine_distance_mi",   # great-circle distance -- tests whether the tree exploits
                                 # a road-vs-great-circle discrepancy (route circuity) that
@@ -177,22 +187,98 @@ GBM_NUMERIC_FEATURES = [
 # zero examples of the "True" case to learn a holiday effect from, so
 # including it would just be dead weight. day_of_year_sin/cos remains the
 # seasonality proxy.
-GBM_CATEGORICAL_FEATURE = "equipment"
+OLD_GBM_CATEGORICAL_FEATURES = ["equipment"]
+
+# NEW feature set (this session): adds weight_per_mile and
+# lane_historical_avg_rate (see add_lane_historical_rate) as numeric
+# features, and distance_bucket as a second categorical alongside equipment.
+NEW_GBM_NUMERIC_FEATURES = OLD_GBM_NUMERIC_FEATURES + ["weight_per_mile", "lane_historical_avg_rate"]
+NEW_GBM_CATEGORICAL_FEATURES = ["equipment", "distance_bucket"]
+
+# Hyperparameters selected by the light 4-combo grid search last session --
+# kept as a fixed constant (rather than re-run) purely to reproduce the "OLD
+# tuned GBM" reference row in the final comparison table.
+OLD_TUNED_PARAMS = {"learning_rate": 0.05, "max_leaf_nodes": 15}
 
 
-def _build_gbm_matrix(df: pd.DataFrame, feature_columns: list[str] | None = None) -> pd.DataFrame:
-    """Numeric features + one-hot encoded equipment (HistGradientBoostingRegressor
+def add_lane_historical_rate(df: pd.DataFrame) -> pd.DataFrame:
+    """Add lane_historical_avg_rate: for each row, the mean posted_rate of all
+    OTHER rows sharing the same (pickup, delivery) lane from STRICTLY EARLIER
+    dates only (same-day and future rows excluded). Rows on a lane's first
+    active date (no prior history) fall back to a global "market as of that
+    date" average -- also expanding/causal, not the full-dataset mean, so
+    early rows aren't implicitly told about rate levels from later in the
+    year. The very first calendar date overall has no causal fallback
+    either way and uses the full-dataset mean for that handful of rows only
+    (a tiny, documented exception, not a meaningful leak).
+
+    Computed with two groupby+cumsum passes over per-(lane, date) and
+    per-date aggregates -- O(n log n), not a row-by-row loop:
+      1. Sum/count posted_rate per (pickup, delivery, date), cumsum within
+         each lane ordered by date, then subtract the current date's own
+         contribution to get the strictly-prior cumulative sum/count.
+      2. Same idea per date only (ignoring lane) for the fallback.
+    The per-(lane, date) result is then mapped back onto every row sharing
+    that (pickup, delivery, date) key.
+    """
+    out = df.copy()
+    keys = ["pickup", "delivery", "date"]
+
+    lane_date = out.groupby(keys)["posted_rate"].agg(["sum", "count"]).reset_index()
+    lane_date = lane_date.sort_values(["pickup", "delivery", "date"])
+    lane_group = lane_date.groupby(["pickup", "delivery"])
+    lane_date["prior_sum"] = lane_group["sum"].cumsum() - lane_date["sum"]
+    lane_date["prior_count"] = lane_group["count"].cumsum() - lane_date["count"]
+
+    date_totals = out.groupby("date")["posted_rate"].agg(["sum", "count"]).sort_index().reset_index()
+    date_totals["prior_sum"] = date_totals["sum"].cumsum() - date_totals["sum"]
+    date_totals["prior_count"] = date_totals["count"].cumsum() - date_totals["count"]
+    overall_mean = out["posted_rate"].mean()
+    date_totals["global_prior_avg"] = np.where(
+        date_totals["prior_count"] > 0,
+        date_totals["prior_sum"] / date_totals["prior_count"],
+        overall_mean,
+    )
+
+    lane_date = lane_date.merge(date_totals[["date", "global_prior_avg"]], on="date", how="left")
+    lane_date["lane_historical_avg_rate"] = np.where(
+        lane_date["prior_count"] > 0,
+        lane_date["prior_sum"] / lane_date["prior_count"],
+        lane_date["global_prior_avg"],
+    )
+
+    feature_map = lane_date.set_index(keys)["lane_historical_avg_rate"]
+    out["lane_historical_avg_rate"] = out.set_index(keys).index.map(feature_map)
+    return out
+
+
+def _build_gbm_matrix(
+    df: pd.DataFrame,
+    numeric_features: list[str],
+    categorical_features: list[str],
+    feature_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Numeric features + one-hot encoded categoricals (HistGradientBoostingRegressor
     doesn't take native categoricals as cleanly as LightGBM would have, so we
-    one-hot it instead). `feature_columns`, when given, re-aligns the output
+    one-hot them instead). `feature_columns`, when given, re-aligns the output
     to a fixed training-time schema so a prediction-time frame can't end up
     with mismatched/missing dummy columns.
     """
-    numeric = df[GBM_NUMERIC_FEATURES]
-    dummies = pd.get_dummies(df[GBM_CATEGORICAL_FEATURE], prefix="equipment")
+    numeric = df[numeric_features]
+    dummies = pd.get_dummies(df[categorical_features])
     X = pd.concat([numeric, dummies], axis=1)
     if feature_columns is not None:
         X = X.reindex(columns=feature_columns, fill_value=0)
     return X
+
+
+def _gbm_design_matrix(model: dict, df: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild a GBM model dict's design matrix for a new dataframe, using
+    the exact numeric/categorical feature lists and one-hot schema it was
+    trained with."""
+    return _build_gbm_matrix(
+        df, model["numeric_features"], model["categorical_features"], feature_columns=model["feature_columns"]
+    )
 
 
 _DEFAULT_GBM_PARAMS = {
@@ -207,55 +293,94 @@ _DEFAULT_GBM_PARAMS = {
     "random_state": 0,
 }
 
-# Light manual tuning grid, not a full sweep -- just enough that we're not
-# comparing a badly-undertuned GBM against a properly-specified GLM.
-# learning_rate/max_leaf_nodes trade off under- vs over-fitting; max_iter is
-# capped high (500) with early stopping so it doesn't need separate tuning.
-GBM_TUNING_GRID = [
-    {"learning_rate": 0.05, "max_leaf_nodes": 15},
-    {"learning_rate": 0.05, "max_leaf_nodes": 31},
-    {"learning_rate": 0.1, "max_leaf_nodes": 15},
-    {"learning_rate": 0.1, "max_leaf_nodes": 31},
-]
 
-
-def fit_gbm(train_df: pd.DataFrame, **hyperparams) -> dict:
+def fit_gbm(
+    train_df: pd.DataFrame,
+    numeric_features: list[str] | None = None,
+    categorical_features: list[str] | None = None,
+    target: str = "raw",
+    **hyperparams,
+) -> dict:
     """Fit a HistGradientBoostingRegressor challenger on train_df.
 
-    Returns a dict of {"estimator", "feature_columns"} rather than the bare
-    estimator: feature_columns pins the one-hot schema from training time so
-    predict_gbm can realign any future dataframe to match exactly.
+    numeric_features/categorical_features default to NEW_GBM_* (this
+    session's feature set); pass OLD_GBM_* explicitly to reproduce last
+    session's model. target="raw" fits posted_rate directly; target=
+    "rate_per_mile" fits posted_rate/distance instead and predict_gbm
+    multiplies back by distance -- see main() for the head-to-head test of
+    which target actually wins on this data.
+
+    Returns a dict of {"estimator", "feature_columns", "numeric_features",
+    "categorical_features", "target"} rather than the bare estimator: this
+    makes every fitted model self-describing, so predict_gbm (and SHAP) can
+    rebuild the exact right design matrix and undo the right target
+    transform without the caller having to remember how it was fit.
     """
-    X = _build_gbm_matrix(train_df)
-    y = train_df["posted_rate"].to_numpy()
+    numeric_features = NEW_GBM_NUMERIC_FEATURES if numeric_features is None else numeric_features
+    categorical_features = NEW_GBM_CATEGORICAL_FEATURES if categorical_features is None else categorical_features
+
+    X = _build_gbm_matrix(train_df, numeric_features, categorical_features)
+    if target == "raw":
+        y = train_df["posted_rate"].to_numpy()
+    elif target == "rate_per_mile":
+        y = (train_df["posted_rate"] / train_df["distance"]).to_numpy()
+    else:
+        raise ValueError(f"unknown target {target!r}, expected 'raw' or 'rate_per_mile'")
 
     params = {**_DEFAULT_GBM_PARAMS, **hyperparams}
     estimator = HistGradientBoostingRegressor(**params)
     estimator.fit(X, y)
 
-    return {"estimator": estimator, "feature_columns": list(X.columns)}
+    return {
+        "estimator": estimator,
+        "feature_columns": list(X.columns),
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
+        "target": target,
+    }
 
 
 def predict_gbm(model: dict, df: pd.DataFrame) -> np.ndarray:
     """Predict posted_rate for new rows using a fitted GBM challenger dict."""
-    X = _build_gbm_matrix(df, feature_columns=model["feature_columns"])
-    return np.asarray(model["estimator"].predict(X))
+    X = _gbm_design_matrix(model, df)
+    preds = np.asarray(model["estimator"].predict(X))
+    if model["target"] == "rate_per_mile":
+        preds = preds * df["distance"].to_numpy()
+    return preds
 
 
-def _tune_gbm(train_df: pd.DataFrame, val_df: pd.DataFrame) -> dict:
-    """Light grid search over GBM_TUNING_GRID on a single representative
-    split (fold 2, closest analog to the real train->validation gap).
+def _tune_gbm_optuna(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    n_trials: int = 30,
+    numeric_features: list[str] | None = None,
+    categorical_features: list[str] | None = None,
+) -> optuna.Study:
+    """Real hyperparameter search (TPE sampler, `n_trials` trials) over
+    learning_rate, max_leaf_nodes, max_iter, min_samples_leaf, and
+    l2_regularization, minimizing held-out MAE on val_df. Uses a fixed seed
+    for reproducibility. Whatever wins here still gets validated across all
+    3 folds afterward in main() -- this alone only proves it's good on
+    fold 2, not that it generalizes.
     """
-    best_params, best_mae = None, np.inf
-    for params in GBM_TUNING_GRID:
-        model = fit_gbm(train_df, **params)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 8, 255),
+            "max_iter": trial.suggest_int("max_iter", 100, 800),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 100),
+            "l2_regularization": trial.suggest_float("l2_regularization", 1e-4, 10.0, log=True),
+        }
+        model = fit_gbm(
+            train_df, numeric_features=numeric_features, categorical_features=categorical_features, **params
+        )
         preds = predict_gbm(model, val_df)
-        mae = _regression_metrics(val_df["posted_rate"].to_numpy(), preds)["MAE"]
-        print(f"  tuning candidate {params} -> val MAE=${mae:.2f}")
-        if mae < best_mae:
-            best_mae, best_params = mae, params
-    print(f"  selected {best_params} (val MAE=${best_mae:.2f})")
-    return best_params
+        return _regression_metrics(val_df["posted_rate"].to_numpy(), preds)["MAE"]
+
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=0))
+    study.optimize(objective, n_trials=n_trials)
+    return study
 
 
 def _gbm_shap_importance(model: dict, X: pd.DataFrame, max_samples: int = 3000) -> pd.Series:
@@ -278,6 +403,21 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "RMSE": float(np.sqrt(np.mean(err**2))),
         "MAPE": float(np.mean(np.abs(err / y_true)) * 100),
     }
+
+
+def _print_error_buckets(val_df: pd.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    """Print MAE bucketed by equipment, distance quartile, weight_was_missing,
+    market_index_was_missing, and day_of_week -- a quick look at whether
+    errors cluster somewhere specific before tuning/adding features blindly.
+    """
+    diag = val_df.copy()
+    diag["abs_error"] = np.abs(y_true - y_pred)
+    diag["distance_quartile"] = pd.qcut(diag["distance"], 4, labels=["Q1 (shortest)", "Q2", "Q3", "Q4 (longest)"])
+
+    for col in ["equipment", "distance_quartile", "weight_was_missing", "market_index_was_missing", "day_of_week"]:
+        print(f"\nMAE by {col}:")
+        summary = diag.groupby(col, observed=True)["abs_error"].agg(["mean", "count"]).rename(columns={"mean": "MAE"})
+        print(summary.round(2).to_string())
 
 
 def _md_table(df: pd.DataFrame, index_name: str = "") -> str:
@@ -384,39 +524,61 @@ def main() -> None:
     print(glm_fold_models[2].summary())
 
     # ------------------------------------------------------------------
-    # GBM challenger: light tuning on fold 2, then same 3 folds
+    # Add lane_historical_avg_rate now: causal/expanding over the whole
+    # Jan-Oct chronology of `train`, so it's computed once regardless of
+    # fold boundaries (see add_lane_historical_rate docstring for why this
+    # doesn't leak). weight_per_mile and distance_bucket already came from
+    # build_features() at the top of main().
+    # ------------------------------------------------------------------
+    train = add_lane_historical_rate(train)
+    fold2_train = train.loc[fold2["train_idx"]]
+    fold2_val = train.loc[fold2["val_idx"]]
+
+    # ------------------------------------------------------------------
+    # OLD tuned GBM (last session's feature set + hyperparams, reproduced
+    # exactly via OLD_GBM_* / OLD_TUNED_PARAMS), per fold. Used both as the
+    # "GBM" column in the legacy GLM comparison below and as the reference
+    # row for this session's OLD-vs-NEW GBM comparison (TASK 5).
     # ------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("GBM challenger -- light tuning on fold 2 (train n={:,}, val n={:,}):".format(
-        len(fold2_train), len(fold2_val)
-    ))
+    print(f"OLD tuned GBM (features={OLD_GBM_NUMERIC_FEATURES + OLD_GBM_CATEGORICAL_FEATURES}, params={OLD_TUNED_PARAMS})")
     print("=" * 80)
-    best_gbm_params = _tune_gbm(fold2_train, fold2_val)
-
-    print("\n" + "=" * 80)
-    print("GBM challenger -- per-fold evaluation (tuned params applied to all folds)")
-    print("=" * 80)
-    gbm_fold_metrics = []
-    gbm_fold_models = {}
+    old_gbm_fold_metrics = []
+    old_gbm_fold_models = {}
     for fold in folds:
         train_slice = train.loc[fold["train_idx"]]
         val_slice = train.loc[fold["val_idx"]]
-
-        model = fit_gbm(train_slice, **best_gbm_params)
-        gbm_fold_models[fold["fold"]] = model
-
+        model = fit_gbm(
+            train_slice,
+            numeric_features=OLD_GBM_NUMERIC_FEATURES,
+            categorical_features=OLD_GBM_CATEGORICAL_FEATURES,
+            **OLD_TUNED_PARAMS,
+        )
+        old_gbm_fold_models[fold["fold"]] = model
         preds = predict_gbm(model, val_slice)
         metrics = _regression_metrics(val_slice["posted_rate"].to_numpy(), preds)
-        gbm_fold_metrics.append(metrics)
+        old_gbm_fold_metrics.append(metrics)
         print(f"Fold {fold['fold']}: MAE=${metrics['MAE']:.2f}  RMSE=${metrics['RMSE']:.2f}  MAPE={metrics['MAPE']:.2f}%")
 
     # ------------------------------------------------------------------
-    # Three-way comparison table: OLD log-link GLM, CORRECTED GLM, GBM
+    # TASK 1: error diagnostic on the OLD tuned GBM's fold-2 predictions,
+    # before any new tuning/features -- print only.
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TASK 1: error diagnostic -- OLD tuned GBM, fold 2 held-out predictions, bucketed MAE")
+    print("=" * 80)
+    old_fold2_preds = predict_gbm(old_gbm_fold_models[2], fold2_val)
+    _print_error_buckets(fold2_val, fold2_val["posted_rate"].to_numpy(), old_fold2_preds)
+
+    # ------------------------------------------------------------------
+    # Three-way comparison table: OLD log-link GLM, CORRECTED GLM, OLD GBM
+    # (unchanged from last session, just reusing old_gbm_fold_metrics
+    # instead of re-running the now-removed manual grid search)
     # ------------------------------------------------------------------
     fold_names = [f"fold_{f['fold']}" for f in folds]
     old_glm_df = pd.DataFrame(old_glm_fold_metrics, index=fold_names)
     glm_df = pd.DataFrame(glm_fold_metrics, index=fold_names)
-    gbm_df = pd.DataFrame(gbm_fold_metrics, index=fold_names)
+    gbm_df = pd.DataFrame(old_gbm_fold_metrics, index=fold_names)
     comparison = pd.concat(
         {"OLD log-link GLM": old_glm_df, "CORRECTED GLM": glm_df, "GBM": gbm_df}, axis=1
     )
@@ -438,13 +600,14 @@ def main() -> None:
     print(mean_std.to_string())
 
     # ------------------------------------------------------------------
-    # SHAP feature importance on fold 2's GBM
+    # SHAP feature importance on fold 2's OLD GBM (unchanged from last
+    # session, kept for report continuity)
     # ------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("SHAP feature importance, fold 2 GBM (mean |SHAP value|, sampled from fold 2 train):")
+    print("SHAP feature importance, fold 2 OLD GBM (mean |SHAP value|, sampled from fold 2 train):")
     print("=" * 80)
-    fold2_X = _build_gbm_matrix(fold2_train, feature_columns=gbm_fold_models[2]["feature_columns"])
-    importance = _gbm_shap_importance(gbm_fold_models[2], fold2_X)
+    old_fold2_X = _gbm_design_matrix(old_gbm_fold_models[2], fold2_train)
+    importance = _gbm_shap_importance(old_gbm_fold_models[2], old_fold2_X)
     print(importance.round(3).to_string())
 
     noise_features = ["market_index", "quote_signal"]
@@ -466,17 +629,146 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Final production GBM, full train_test.csv
+    # TASK 3: real hyperparameter search (Optuna, 30 trials), fold 2,
+    # NEW feature set (fit_gbm's default), raw target
+    # ------------------------------------------------------------------
+    n_trials = 30
+    print("\n" + "=" * 80)
+    print(f"TASK 3: Optuna hyperparameter search ({n_trials} trials), fold 2, NEW feature set, raw target")
+    print("=" * 80)
+    study = _tune_gbm_optuna(fold2_train, fold2_val, n_trials=n_trials)
+    best_params = study.best_params
+    print(f"Best trial: val MAE=${study.best_value:.2f}")
+    print(f"Best params: {best_params}")
+
+    print("\nValidating the winning config across all 3 folds (not just fold 2 it was tuned on):")
+    new_raw_fold_metrics = []
+    new_raw_fold_models = {}
+    for fold in folds:
+        train_slice = train.loc[fold["train_idx"]]
+        val_slice = train.loc[fold["val_idx"]]
+        model = fit_gbm(train_slice, target="raw", **best_params)
+        new_raw_fold_models[fold["fold"]] = model
+        preds = predict_gbm(model, val_slice)
+        metrics = _regression_metrics(val_slice["posted_rate"].to_numpy(), preds)
+        new_raw_fold_metrics.append(metrics)
+        print(f"Fold {fold['fold']}: MAE=${metrics['MAE']:.2f}  RMSE=${metrics['RMSE']:.2f}  MAPE={metrics['MAPE']:.2f}%")
+
+    # ------------------------------------------------------------------
+    # TASK 4: rate_per_mile alternate target, same tuned hyperparams, same
+    # 3 folds -- test it, don't assume it wins.
     # ------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("Fitting final GBM on the full train_test.csv (48,000 rows), tuned params:", best_gbm_params)
+    print("TASK 4: rate_per_mile alternate target (same tuned hyperparams), all 3 folds")
     print("=" * 80)
-    final_gbm = fit_gbm(train, **best_gbm_params)
+    new_rpm_fold_metrics = []
+    new_rpm_fold_models = {}
+    for fold in folds:
+        train_slice = train.loc[fold["train_idx"]]
+        val_slice = train.loc[fold["val_idx"]]
+        model = fit_gbm(train_slice, target="rate_per_mile", **best_params)
+        new_rpm_fold_models[fold["fold"]] = model
+        preds = predict_gbm(model, val_slice)
+        metrics = _regression_metrics(val_slice["posted_rate"].to_numpy(), preds)
+        new_rpm_fold_metrics.append(metrics)
+        print(f"Fold {fold['fold']}: MAE=${metrics['MAE']:.2f}  RMSE=${metrics['RMSE']:.2f}  MAPE={metrics['MAPE']:.2f}%")
 
+    raw_mean_mae = float(np.mean([m["MAE"] for m in new_raw_fold_metrics]))
+    rpm_mean_mae = float(np.mean([m["MAE"] for m in new_rpm_fold_metrics]))
+    if rpm_mean_mae < raw_mean_mae:
+        winning_target = "rate_per_mile"
+        new_gbm_fold_metrics, new_gbm_fold_models = new_rpm_fold_metrics, new_rpm_fold_models
+    else:
+        winning_target = "raw"
+        new_gbm_fold_metrics, new_gbm_fold_models = new_raw_fold_metrics, new_raw_fold_models
+    print(
+        f"\nTarget comparison, mean MAE across 3 folds: raw=${raw_mean_mae:.2f} vs "
+        f"rate_per_mile=${rpm_mean_mae:.2f} -> '{winning_target}' wins, used for the NEW model below."
+    )
+    if winning_target == "raw":
+        print("(rate_per_mile did NOT beat predicting the raw rate directly on this data -- reported for honesty, not used.)")
+
+    # ------------------------------------------------------------------
+    # SHAP feature importance, NEW model, fold 2 -- check the new features
+    # actually earn their place, and re-check market_index/quote_signal
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print(f"SHAP feature importance, fold 2 NEW GBM (target={winning_target}):")
+    print("=" * 80)
+    new_fold2_X = _gbm_design_matrix(new_gbm_fold_models[2], fold2_train)
+    new_importance = _gbm_shap_importance(new_gbm_fold_models[2], new_fold2_X)
+    print(new_importance.round(3).to_string())
+    new_feature_ranks = {
+        f: list(new_importance.index).index(f) + 1
+        for f in ["lane_historical_avg_rate", "weight_per_mile", "market_index", "quote_signal"]
+        if f in new_importance.index
+    }
+    print(f"\nKey feature ranks (out of {len(new_importance)}): {new_feature_ranks}")
+
+    # ------------------------------------------------------------------
+    # TASK 5: OLD tuned GBM vs NEW tuned GBM, same 3 folds, same metrics
+    # ------------------------------------------------------------------
+    old_gbm_df = pd.DataFrame(old_gbm_fold_metrics, index=fold_names)
+    new_gbm_df = pd.DataFrame(new_gbm_fold_metrics, index=fold_names)
+    new_gbm_label = f"NEW tuned GBM ({winning_target})"
+    gbm_comparison = pd.concat({"OLD tuned GBM": old_gbm_df, new_gbm_label: new_gbm_df}, axis=1)
+
+    print("\n" + "=" * 80)
+    print("TASK 5: OLD tuned GBM vs NEW tuned GBM -- per-fold comparison:")
+    print("=" * 80)
+    print(gbm_comparison.round(3).to_string())
+
+    gbm_mean_std = pd.concat(
+        {
+            "OLD tuned GBM": pd.DataFrame({"mean": old_gbm_df.mean(), "std": old_gbm_df.std()}),
+            new_gbm_label: pd.DataFrame({"mean": new_gbm_df.mean(), "std": new_gbm_df.std()}),
+        },
+        axis=1,
+    ).round(3)
+    print("\nMean ± std across folds:")
+    print(gbm_mean_std.to_string())
+
+    # ------------------------------------------------------------------
+    # TASK 6: decide clear win vs wash, save/report accordingly. No
+    # hardcoded winner -- the >2%-and-every-fold rule below is the only
+    # judgment call, applied uniformly to whatever the numbers turn out to be.
+    # ------------------------------------------------------------------
+    mae_improvement_pct = (1 - new_gbm_df["MAE"].mean() / old_gbm_df["MAE"].mean()) * 100
+    new_wins_every_fold = bool((new_gbm_df["MAE"].to_numpy() < old_gbm_df["MAE"].to_numpy()).all())
+    clear_win = new_wins_every_fold and mae_improvement_pct > 2.0
+
+    print(
+        f"\nMean MAE improvement (positive = NEW is better): {mae_improvement_pct:+.1f}% "
+        f"({'better on every fold' if new_wins_every_fold else 'NOT better on every fold'}) "
+        f"-> {'CLEAR WIN: promoting NEW model' if clear_win else 'NOT a clear win: keeping OLD model'}"
+    )
+
+    # Re-save the chosen configuration (OLD or NEW) either way: the
+    # gbm_challenger.pkl already on disk from last session was pickled under
+    # the pre-this-session dict schema ({"estimator", "feature_columns"}
+    # only) and is no longer compatible with predict_gbm(), which now also
+    # needs "numeric_features"/"categorical_features"/"target". "Not a clear
+    # win" means we keep the OLD *configuration* (features/hyperparameters),
+    # not that we leave a stale, incompatible pickle in place.
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     gbm_out_path = MODELS_DIR / "gbm_challenger.pkl"
-    joblib.dump(final_gbm, gbm_out_path)
-    print(f"Saved final GBM to {gbm_out_path}")
+    if clear_win:
+        final_gbm = fit_gbm(train, target=winning_target, **best_params)
+        joblib.dump(final_gbm, gbm_out_path)
+        print(f"Saved NEW GBM (target={winning_target}, params={best_params}) to {gbm_out_path}, overwriting the OLD one.")
+    else:
+        final_gbm = fit_gbm(
+            train,
+            numeric_features=OLD_GBM_NUMERIC_FEATURES,
+            categorical_features=OLD_GBM_CATEGORICAL_FEATURES,
+            **OLD_TUNED_PARAMS,
+        )
+        joblib.dump(final_gbm, gbm_out_path)
+        print(
+            f"Re-saved the OLD tuned GBM configuration (unchanged features/hyperparams) to {gbm_out_path} "
+            "in the current model-dict format, since last session's pickle predates the "
+            "numeric_features/categorical_features/target fields predict_gbm() now relies on."
+        )
 
     # ------------------------------------------------------------------
     # Final production GLM, full train_test.csv (corrected link, overwrites
@@ -545,8 +837,68 @@ def main() -> None:
         "\nA negative-prediction check on the identity-link GLM across all 3 folds found "
         f"{total_neg}/{total_n} negative predictions ({neg_frac:.4f}%) -- negligible, so "
         "no output clipping was added to predict_glm.\n",
-        "\nNo model has been selected for production yet; that decision is pending "
-        "further review of both models' behavior on validation.csv.\n",
+        "\n## GBM improvement pass: features, real tuning, OLD vs NEW\n",
+        "Starting point was the OLD tuned GBM above "
+        f"(features: {', '.join(OLD_GBM_NUMERIC_FEATURES + OLD_GBM_CATEGORICAL_FEATURES)}; "
+        f"hyperparameters: {OLD_TUNED_PARAMS}, picked by a 4-combo manual grid). Before "
+        "changing anything, fold 2's held-out errors were bucketed by equipment, distance "
+        "quartile, weight_was_missing, market_index_was_missing, and day_of_week to check "
+        "whether error concentrates somewhere specific (full breakdown printed to console, "
+        "not reproduced here).\n",
+        "\n**What changed:**\n",
+        "- Added `lane_historical_avg_rate`: an expanding, causal per-lane average of "
+        "posted_rate using only strictly-earlier dates (same-day and future rows excluded), "
+        "with a causal global-average fallback for lanes with no prior history yet. Computed "
+        "with two groupby+cumsum passes over the whole chronology, not a row-by-row loop.\n",
+        "- Added `weight_per_mile` (weight / distance) and `distance_bucket` "
+        "(short/medium/long haul, fixed cutoffs at 700mi/1300mi) as new features.\n",
+        "- Replaced the 4-combo manual grid with a real Optuna search "
+        f"({n_trials} trials, TPE sampler) over learning_rate, max_leaf_nodes, max_iter, "
+        "min_samples_leaf, and l2_regularization, tuned on fold 2 and then validated across "
+        "all 3 folds (not just the fold it was tuned on).\n",
+        "- Tested `rate_per_mile` (posted_rate/distance) as an alternate training target "
+        f"against predicting posted_rate directly: mean MAE across all 3 folds was "
+        f"${raw_mean_mae:.2f} (raw) vs ${rpm_mean_mae:.2f} (rate_per_mile) -> "
+        f"**'{winning_target}' won**"
+        + (
+            ", so rate_per_mile is reported here for completeness but was not used in the final model.\n"
+            if winning_target == "raw"
+            else ".\n"
+        ),
+        "\n**SHAP check on the new features:** "
+        f"in the fold-2 NEW model, key feature ranks (1=most important, out of "
+        f"{len(new_importance)} features) were {new_feature_ranks}. "
+        + (
+            "market_index/quote_signal stayed out of the top of the ranking, consistent "
+            "with EDA's <0.1 residual-correlation finding -- the new features didn't change "
+            "that read.\n"
+            if all(new_feature_ranks.get(f, 99) > 4 for f in ["market_index", "quote_signal"])
+            else "market_index/quote_signal moved into the top ranks here -- worth a second "
+            "look before trusting it, per the same overfitting-to-noise concern raised for "
+            "the OLD model.\n"
+        ),
+        "\n### OLD tuned GBM vs NEW tuned GBM, per fold\n",
+        _md_table(gbm_comparison.round(3), "fold") + "\n",
+        "\n**Mean ± std across folds:**\n",
+        _md_table(gbm_mean_std.round(3), "metric") + "\n",
+        f"\n**Result: NEW model's mean MAE improved by {mae_improvement_pct:.1f}% over OLD "
+        f"({'better on every fold' if new_wins_every_fold else 'not better on every fold'}).** "
+        + (
+            f"This clears the bar for a real improvement (>2%, consistent across all 3 folds), "
+            f"so `models/gbm_challenger.pkl` was overwritten with the NEW model "
+            f"(target={winning_target}, params={best_params}).\n"
+            if clear_win
+            else "This is not a clear win -- either the improvement is too small, inconsistent "
+            "across folds, or both. Recommendation: keep the existing OLD tuned GBM "
+            "configuration (same features/hyperparameters as last session) in production "
+            "rather than adding the complexity (extra features, a heavier tuning process) of "
+            "the NEW model for no reliable gain. `models/gbm_challenger.pkl` was re-saved "
+            "with that same OLD configuration purely to match the current model-dict format "
+            "(predict_gbm() now needs numeric_features/categorical_features/target fields "
+            "last session's pickle didn't have) -- nothing about the model itself changed.\n"
+        ),
+        "\nNo GLM-vs-GBM production decision has been made yet; that, plus validation.csv "
+        "and december_chart_inputs.csv predictions, is the next and final step.\n",
     ]
     report_path.write_text("\n".join(report_lines))
     print(f"\nWrote {report_path}")
