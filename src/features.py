@@ -109,6 +109,15 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
       haul-length x season interactions that it could in principle rediscover from
       continuous `distance` alone, but only by spending extra splits/depth to do so.
 
+    EXPERIMENTAL, TESTED, NOT ADOPTED: weight_per_mile and distance_bucket were
+    added to the GBM's feature set in src/models.py, tuned, and compared against
+    the production configuration across all 3 CV folds -- the resulting model
+    improved mean MAE but wasn't better on every fold, so it wasn't promoted
+    (see src/models.py's NEW_GBM_NUMERIC_FEATURES comment and
+    reports/model_comparison.md). Still computed here since they're harmless,
+    generically useful columns and other code (src/models.py's NEW_GBM_* path)
+    still exercises them for that comparison's reproducibility.
+
     equipment is left as-is; see the module-level comment for how to encode it.
     """
     out = df.copy()

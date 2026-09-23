@@ -189,9 +189,17 @@ OLD_GBM_NUMERIC_FEATURES = [
 # seasonality proxy.
 OLD_GBM_CATEGORICAL_FEATURES = ["equipment"]
 
-# NEW feature set (this session): adds weight_per_mile and
-# lane_historical_avg_rate (see add_lane_historical_rate) as numeric
-# features, and distance_bucket as a second categorical alongside equipment.
+# EXPERIMENTAL, TESTED, NOT ADOPTED: this feature set (weight_per_mile,
+# lane_historical_avg_rate, distance_bucket added on top of OLD_GBM_*) was
+# tuned and evaluated against OLD_GBM_* across all 3 folds in main()'s
+# TASK 5 comparison. It improved mean MAE by 5.1% but was worse on fold 0,
+# so it failed the "better on every fold" bar and was NOT promoted to
+# production -- models/gbm_challenger.pkl still uses OLD_GBM_*. Kept here
+# (not deleted) because main() still uses it to reproduce that comparison
+# for reports/model_comparison.md; it is fit_gbm()'s *default* feature set
+# when numeric_features/categorical_features aren't passed explicitly, so
+# calling fit_gbm(df) without arguments reproduces the untested-for-
+# production configuration, not the one actually in models/gbm_challenger.pkl.
 NEW_GBM_NUMERIC_FEATURES = OLD_GBM_NUMERIC_FEATURES + ["weight_per_mile", "lane_historical_avg_rate"]
 NEW_GBM_CATEGORICAL_FEATURES = ["equipment", "distance_bucket"]
 
@@ -202,7 +210,14 @@ OLD_TUNED_PARAMS = {"learning_rate": 0.05, "max_leaf_nodes": 15}
 
 
 def add_lane_historical_rate(df: pd.DataFrame) -> pd.DataFrame:
-    """Add lane_historical_avg_rate: for each row, the mean posted_rate of all
+    """EXPERIMENTAL, TESTED, NOT ADOPTED (see NEW_GBM_NUMERIC_FEATURES):
+    part of the feature set that didn't clear the bar for production. Kept
+    for reference and because main() still calls it to reproduce that
+    comparison. src/predict.py computes its own simpler constant-value
+    version of this for December's single fixed lane, rather than calling
+    this function, since it doesn't need the general multi-lane case.
+
+    Add lane_historical_avg_rate: for each row, the mean posted_rate of all
     OTHER rows sharing the same (pickup, delivery) lane from STRICTLY EARLIER
     dates only (same-day and future rows excluded). Rows on a lane's first
     active date (no prior history) fall back to a global "market as of that
@@ -629,6 +644,13 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
+    # EXPERIMENTAL, TESTED, NOT ADOPTED from here through TASK 6: this
+    # entire block evaluates the NEW_GBM_* feature set (see its definition
+    # above) against the OLD_GBM_* configuration actually in production.
+    # It did not clear the bar (better on every fold) and was not promoted
+    # -- see the TASK 6 decision below and reports/model_comparison.md.
+    # Kept so the comparison in that report stays reproducible.
+    #
     # TASK 3: real hyperparameter search (Optuna, 30 trials), fold 2,
     # NEW feature set (fit_gbm's default), raw target
     # ------------------------------------------------------------------
