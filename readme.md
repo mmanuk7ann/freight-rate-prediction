@@ -40,10 +40,3 @@ reports/
 python -m pip install -r requirements.txt
 python src/predict.py
 python score.py --predictions validation_predictions.csv --december-predictions december_predictions.csv
-
-
----
-
-## Original assessment brief (Spotter AI)
-
-*Everything below this line is the original brief provided with the assessment, unchanged.*
