@@ -41,10 +41,6 @@ python -m pip install -r requirements.txt
 python src/predict.py
 python score.py --predictions validation_predictions.csv --december-predictions december_predictions.csv
 
-## Full report and walkthrough
-
-The full write-up with methodology and validation details is in `reports/`, along with the accompanying PDF/DOCX report.
-
 
 ---
 
